@@ -1,0 +1,200 @@
+/*
+ * REQHEAD.C
+ * =========
+ *
+ * Implementation of functions for manipulating HTTP request headers.
+ * 
+ * File:   reqhead.c
+ * Author: avrbanac
+ *
+ * Created on March 14, 2016, 10:51 AM
+ */
+
+/*  For select()  */
+#include <sys/time.h>
+
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "../inc/reqhead.h"
+#include "../inc/servreq.h"
+#include "../inc/helper.h"
+#include "../inc/config.h"
+
+/*  Parses a string and updates a request
+    information structure if necessary. */
+int ParseHTTPHeader(char *buffer, struct ReqInfo *reqInfo) {
+
+    static int  first_header = 1;
+    char        *temp, *endPtr;
+    int         len;
+
+    if (first_header == 1) {
+
+		/*  If first_header is 0, this is the request line.  */
+
+		/*  Get the request method, which is case-sensitive. This
+		    version of the server only supports the GET and HEAD
+		    request methods.                                        */
+		if (!strncmp(buffer, "GET ", 4)) {
+		    reqInfo->method = GET;
+		    buffer += 4;
+		}
+		else if (!strncmp(buffer, "HEAD ", 5)) {
+		    reqInfo->method = HEAD;
+		    buffer += 5;
+		}
+		else {
+		    reqInfo->method = UNSUPPORTED;
+		    reqInfo->status = 501;
+		    return -1;
+		}
+
+		/*  FF to start of resource  */
+		while (*buffer && isspace(*buffer)) buffer++;
+
+		/*  Calc string length of resource...  */
+		endPtr = strchr(buffer, ' ');
+
+		if (endPtr == NULL) len = strlen(buffer);
+		else len = endPtr - buffer;
+		if (len == 0) {
+		    reqInfo->status = 400;
+		    return -1;
+		}
+
+		/* Store it in the request information structure.  */
+		reqInfo->resource = calloc(len + 1, sizeof(char));
+		strncpy(reqInfo->resource, buffer, len);
+
+		/*  Test to see if we have any HTTP version information.
+		    If there isn't, this is a simple HTTP request, and we
+		    should not try to read any more headers. For simplicity,
+		    we don't bother checking the validity of the HTTP version
+		    information supplied - we just assume that if it is
+		    supplied, then it's a full request.                        */
+
+		if (strstr(buffer, "HTTP/")) reqInfo->type = FULL;
+		else reqInfo->type = SIMPLE;
+
+		first_header = 0;
+		return 0;
+    }
+
+    /*  If we get here, we have further headers aside from the
+	request line to parse, so this is a "full" HTTP request.  */
+
+    /*  HTTP field names are case-insensitive, so make an
+	upper-case copy of the field name to aid comparison.
+	We need to make a copy of the header up until the colon.
+	If there is no colon, we return a status code of 400
+	(bad request) and terminate the connection. Note that
+	HTTP/1.0 allows (but discourages) headers to span multiple
+	lines if the following lines start with a space or a
+	tab. For simplicity, we do not allow this here.              */
+    endPtr = strchr(buffer, ':');
+    if (endPtr == NULL) {
+		reqInfo->status = 400;
+		return -1;
+    }
+
+    temp = calloc((endPtr - buffer) + 1, sizeof(char));
+    strncpy(temp, buffer, (endPtr - buffer));
+    StrUpper(temp);
+
+    /*  Increment buffer so that it now points to the value.
+	If there is no value, just return.                    */
+    buffer = endPtr + 1;
+    while (*buffer && isspace(*buffer)) ++buffer;
+    if (*buffer == '\0') return 0;
+
+
+    /*  Now update the request information structure with the
+	appropriate field value. This version only supports the
+	"Referer:" and "User-Agent:" headers, ignoring all others.  */
+    if (!strcmp(temp, "USER-AGENT")) {
+	    reqInfo->useragent = malloc(strlen(buffer) + 1);
+	    strcpy(reqInfo->useragent, buffer);
+    }
+    else if (!strcmp(temp, "REFERER") ) {
+	    reqInfo->referer = malloc(strlen(buffer) + 1);
+	    strcpy(reqInfo->referer, buffer);
+    }
+
+    free(temp);
+    return 0;
+}
+
+/*  Gets request headers. A CRLF terminates a HTTP header line,
+    but if one is never sent we would wait forever. Therefore,
+    we use select() to set a maximum length of time we will
+    wait for the next complete header. If we timeout before
+    this is received, we terminate the connection.               */
+int GetRequest(int conn, struct ReqInfo * reqInfo) {
+
+    char   buffer[config.STR_SIZE_L];
+    int    rVal;
+    fd_set fds;
+    struct timeval tv;
+
+    /*  Set timeout to 5 seconds  */
+    tv.tv_sec  = 5;
+    tv.tv_usec = 0;
+
+    *buffer = 0;
+
+    /*  Loop through request headers. If we have a simple request,
+	then we will loop only once. Otherwise, we will loop until
+	we receive a blank line which signifies the end of the headers,
+	or until select() times out, whichever is sooner.                */
+    do {
+
+		/*  Reset file descriptor set  */
+		FD_ZERO(&fds);
+		FD_SET (conn, &fds);
+
+		/*  Wait until the timeout to see if input is ready  */
+		rVal = select(conn + 1, &fds, NULL, NULL, &tv);
+
+		/*  Take appropriate action based on return from select()  */
+		if (rVal < 0) ErrorQuit("Error calling select() in GetRequest()");
+		else if (rVal == 0) {
+		    /*  input not ready after timeout  */
+		    return -1;
+		}
+		else {
+
+		    /*  We have an input line waiting, so retrieve it  */
+		    ReadLine(conn, buffer, config.STR_SIZE_L - 1);
+		    Trim(buffer);
+
+		    if ((buffer[0] == '\0') || (buffer[0] == '\r' || buffer[0] == '\n'))
+			break;
+
+		    if (ParseHTTPHeader(buffer, reqInfo))
+			break;
+		}
+    } while (reqInfo->type != SIMPLE);
+
+    return 0;
+}
+
+/*  Initialises a request information structure  */
+void InitReqInfo(struct ReqInfo * reqInfo) {
+    reqInfo->useragent = NULL;
+    reqInfo->referer   = NULL;
+    reqInfo->resource  = NULL;
+    reqInfo->method    = UNSUPPORTED;
+    reqInfo->status    = 200;          
+}
+
+/*  Frees memory allocated for a request information structure  */
+void FreeReqInfo(struct ReqInfo * reqInfo) {
+    if ( reqInfo->useragent )
+	free(reqInfo->useragent);
+    if ( reqInfo->referer )
+	free(reqInfo->referer);
+    if ( reqInfo->resource )
+	free(reqInfo->resource);
+}
